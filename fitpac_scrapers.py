@@ -494,19 +494,161 @@ class PumpFunScanner:
 
 
 # ---------------------------------------------------------------------------
-# Reddit — organic social mentions
+# CoinGecko Trending — primary social signal source (no auth, no cloud blocks)
+# ---------------------------------------------------------------------------
+class CoinGeckoTrendingScraper:
+    """Pulls the top 15 trending coins and writes one synthetic 'post' per
+    watchlist hit, with count proportional to CoinGecko's internal trending
+    score. Low score = hot → more synthetic posts. This drives
+    SocialTransformerModule's recent-vs-prior window comparison, so a coin
+    entering the trending list produces a real hype_velocity bump."""
+
+    BASE = "https://api.coingecko.com/api/v3/search/trending"
+    AUTHOR = "u/coingecko_trending"
+
+    def scrape(self, watchlist_tickers: List[str]) -> List[Dict]:
+        try:
+            data = _http_get(self.BASE)
+        except urllib.error.URLError as e:
+            logger.warning(f"CoinGecko trending fetch failed: {e}")
+            return []
+
+        coins = data.get("coins") or []
+        watchset = {t.upper() for t in watchlist_tickers}
+        out: List[Dict] = []
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+
+        for coin in coins:
+            item = coin.get("item") or {}
+            symbol = (item.get("symbol") or "").upper()
+            ticker = f"${symbol}"
+            if ticker not in watchset:
+                continue
+
+            score = int(item.get("score") or 0)              # 0=hottest
+            rank = item.get("market_cap_rank") or 9999
+            name = item.get("name") or symbol
+            slug = item.get("slug") or item.get("id") or ""
+            data_blob = item.get("data") or {}
+            pct_24h = 0.0
+            price_change = data_blob.get("price_change_percentage_24h") or {}
+            if isinstance(price_change, dict):
+                pct_24h = float(price_change.get("usd") or 0.0)
+
+            # Synthetic post count proportional to heat. Score 0 → 5 posts,
+            # score ≥ 4 → 1 post. Drives hype_velocity ratio when a coin
+            # moves up/down the trending list between cycles.
+            heat = max(1, 5 - score)
+
+            for i in range(heat):
+                out.append({
+                    "id": f"coingecko_trending:{item.get('id')}:{now.isoformat()}:{i}",
+                    "platform": "coingecko_trending",
+                    "ticker": ticker,
+                    "author": self.AUTHOR,
+                    "text": (
+                        f"{name} ({ticker}) trending on CoinGecko. "
+                        f"Score={score}, rank={rank}, 24h={pct_24h:+.2f}%."
+                    )[:500],
+                    "permalink": f"https://www.coingecko.com/en/coins/{slug}",
+                    "timestamp": now.isoformat(),
+                    "engagement": heat * 100 + max(0, int(pct_24h)),
+                    "bot_flag": 0,
+                })
+
+            logger.info(
+                f"CoinGecko trending: {ticker} score={score} rank={rank} "
+                f"pct24h={pct_24h:+.2f} heat={heat}"
+            )
+
+        logger.info(f"CoinGecko trending: emitted {len(out)} synthetic posts")
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Reddit — organic social mentions (with OAuth upgrade path)
 # ---------------------------------------------------------------------------
 class RedditScraper:
-    BASE = "https://www.reddit.com/r/{sub}/new.json?limit={limit}"
+    """Two modes:
+      (1) OAuth (recommended for cloud deploys). Set REDDIT_CLIENT_ID,
+          REDDIT_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD env vars. Hits
+          https://oauth.reddit.com with a bearer token. 60 req/min limit.
+      (2) Unauthenticated JSON. Reddit hard-blocks this from most cloud IPs
+          (Render, Fly, Heroku). Kept as a fallback for local dev.
+    Toggle-off entirely with FITPAC_REDDIT_ENABLE=0 (default: auto)."""
+
+    UNAUTH_BASE = "https://www.reddit.com/r/{sub}/new.json?limit={limit}"
+    OAUTH_BASE = "https://oauth.reddit.com/r/{sub}/new?limit={limit}"
+    TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 
     def __init__(self, subreddits: List[str] = None, limit_per_sub: int = 50):
         self.subreddits = subreddits or DEFAULT_SUBREDDITS
         self.limit = limit_per_sub
+        self.client_id = os.environ.get("REDDIT_CLIENT_ID", "").strip()
+        self.client_secret = os.environ.get("REDDIT_SECRET", "").strip()
+        self.username = os.environ.get("REDDIT_USERNAME", "").strip()
+        self.password = os.environ.get("REDDIT_PASSWORD", "").strip()
+        self._token: Optional[str] = None
+        self._token_expires: float = 0.0
+
+    @property
+    def has_oauth(self) -> bool:
+        return all([self.client_id, self.client_secret, self.username, self.password])
+
+    @property
+    def enabled(self) -> bool:
+        return os.environ.get("FITPAC_REDDIT_ENABLE", "auto") != "0"
+
+    def _fetch_oauth_token(self) -> Optional[str]:
+        """Grab a fresh bearer token via password grant (script-app flow)."""
+        import base64
+        auth_raw = f"{self.client_id}:{self.client_secret}".encode("utf-8")
+        auth = base64.b64encode(auth_raw).decode("utf-8")
+        body = urllib.parse.urlencode({
+            "grant_type": "password",
+            "username": self.username,
+            "password": self.password,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            self.TOKEN_URL,
+            data=body,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Authorization": f"Basic {auth}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+                payload = json.loads(r.read().decode("utf-8"))
+        except (urllib.error.URLError, urllib.error.HTTPError) as e:
+            logger.warning(f"Reddit OAuth token fetch failed: {e}")
+            return None
+        tok = payload.get("access_token")
+        expires_in = int(payload.get("expires_in") or 3600)
+        self._token = tok
+        self._token_expires = time.time() + expires_in - 60
+        if tok:
+            logger.info("Reddit OAuth: token acquired (expires in %ds)", expires_in)
+        return tok
+
+    def _auth_headers(self) -> Optional[Dict[str, str]]:
+        if not self.has_oauth:
+            return None
+        if self._token is None or time.time() >= self._token_expires:
+            if not self._fetch_oauth_token():
+                return None
+        return {"Authorization": f"Bearer {self._token}"}
 
     def _fetch_sub(self, sub: str) -> List[dict]:
-        url = self.BASE.format(sub=sub, limit=self.limit)
+        headers = self._auth_headers()
+        if headers is not None:
+            url = self.OAUTH_BASE.format(sub=sub, limit=self.limit)
+        else:
+            url = self.UNAUTH_BASE.format(sub=sub, limit=self.limit)
         try:
-            data = _http_get(url)
+            data = _http_get(url, extra_headers=headers)
         except urllib.error.URLError as e:
             logger.warning(f"Reddit /r/{sub} fetch failed: {e}")
             return []
@@ -557,6 +699,12 @@ class BotFilter:
     BOT_KEYWORDS = ("100x", "1000x", "moon mission", "join telegram", "dont miss",
                     "next gem", "pre-sale", "presale", "stealth launch")
 
+    # Synthetic feeds we produce ourselves (CoinGecko trending, etc.) aren't
+    # astroturf — they're structured ground-truth data. Exempt their authors
+    # from heuristics that would otherwise flag them for same-author burst or
+    # duplicate text.
+    TRUSTED_AUTHORS = {"u/coingecko_trending"}
+
     def score(self, posts: List[Dict]) -> List[Dict]:
         if not posts:
             return posts
@@ -565,6 +713,8 @@ class BotFilter:
 
         flagged = 0
         for p in posts:
+            if p.get("author") in self.TRUSTED_AUTHORS:
+                continue
             reasons = []
             text = (p["text"] or "").lower()
             if any(k in text for k in self.BOT_KEYWORDS):
@@ -613,11 +763,38 @@ def scrape_chain_all() -> int:
 
 
 def scrape_social_all() -> int:
-    """Sweep all configured subreddits for ticker mentions. Returns # posts written."""
+    """Fuse social signal from all available sources. Returns # posts written.
+
+    Order:
+      1. CoinGecko trending — always runs (no auth, no cloud blocks).
+      2. Reddit — runs only if OAuth creds set OR FITPAC_REDDIT_ENABLE=force.
+         On cloud IPs the unauth JSON endpoint is basically guaranteed to
+         fail, so we don't even try unless OAuth is configured.
+    Both streams are merged, bot-filtered, and upserted together."""
     watchlist = [t["ticker"] for t in db.list_tickers()]
+    combined: List[Dict] = []
+
+    # --- CoinGecko trending (primary) ---
+    cg_trending = CoinGeckoTrendingScraper()
+    combined.extend(cg_trending.scrape(watchlist))
+
+    # --- Reddit (conditional) ---
     reddit = RedditScraper()
-    raw_posts = reddit.scrape(watchlist)
-    filtered = BotFilter().score(raw_posts)
+    if not reddit.enabled:
+        logger.info("Reddit scraping disabled via FITPAC_REDDIT_ENABLE=0")
+    elif reddit.has_oauth:
+        logger.info("Reddit OAuth credentials present — scraping via oauth.reddit.com")
+        combined.extend(reddit.scrape(watchlist))
+    elif os.environ.get("FITPAC_REDDIT_ENABLE") == "force":
+        logger.info("Reddit scraping forced (unauth mode) — expect 403s on cloud IPs")
+        combined.extend(reddit.scrape(watchlist))
+    else:
+        logger.info(
+            "Reddit OAuth not configured; skipping Reddit. "
+            "Set REDDIT_CLIENT_ID/SECRET/USERNAME/PASSWORD to enable."
+        )
+
+    filtered = BotFilter().score(combined)
     return db.bulk_upsert_posts(filtered)
 
 
