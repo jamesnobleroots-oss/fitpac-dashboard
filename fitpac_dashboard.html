@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>FITPAC Alert Engine · Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<!--
+  Data loading strategy:
+    1. If served by fitpac_server.py, the dashboard fetches /api/alerts on load
+       and polls every 60s. This is how remote users see live data.
+    2. If the file is opened directly (file://…) it falls back to alerts.js,
+       which is written by fitpac_backend.py for local/offline use.
+    3. If neither is available, built-in demo payloads render.
+-->
+<script src="alerts.js" onerror="console.info('alerts.js not found — using /api/alerts or demo payloads')"></script>
+<script>
+  tailwind.config = {
+    theme: { extend: { fontFamily: { mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'] } } }
+  }
+</script>
+<style>
+  body { background: #020617; color: #e2e8f0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  @keyframes ping { 75%, 100% { transform: scale(2); opacity: 0; } }
+  .animate-ping { animation: ping 1.4s cubic-bezier(0,0,0.2,1) infinite; }
+  @keyframes fill { from { stroke-dashoffset: var(--len); } to { stroke-dashoffset: var(--off); } }
+  .gauge-fill { animation: fill 1.2s ease-out forwards; }
+  @keyframes rise { from { transform: scaleY(0); opacity: 0; } to { transform: scaleY(1); opacity: 1; } }
+  .bar-rise { transform-origin: bottom; animation: rise 0.8s cubic-bezier(0.2,0.8,0.2,1) forwards; }
+  pre { white-space: pre-wrap; word-break: break-word; }
+</style>
+</head>
+<body class="min-h-screen">
+<div class="pointer-events-none fixed inset-0 overflow-hidden">
+  <div class="absolute -top-40 -left-40 h-96 w-96 rounded-full bg-violet-600/20 blur-3xl"></div>
+  <div class="absolute top-40 -right-40 h-96 w-96 rounded-full bg-sky-600/20 blur-3xl"></div>
+  <div class="absolute bottom-0 left-1/2 h-96 w-96 -translate-x-1/2 rounded-full bg-emerald-600/10 blur-3xl"></div>
+</div>
+
+<div id="app" class="relative mx-auto max-w-7xl px-6 py-8"></div>
+
+<script>
+// --- MOCK PAYLOADS (matching fitpac_backend.py schema) ---
+const PAYLOADS = {
+  ignition: {
+    timestamp: "2026-04-17T19:44:47.449370",
+    ticker: "$PEPE",
+    signal_status: "VIRAL_IGNITION",
+    confidence_score: 0.82,
+    social_metrics: { hype_velocity: 0.88, authenticity_score: 0.85, influence_weight: 4.9, vip_triggers: ["@CryptoWhale"] },
+    chain_metrics: { insider_distribution_ratio: 0.15, liquidity_depth_usd: 250000, hard_veto_active: false },
+    system_warnings: []
+  },
+  standby: {
+    timestamp: "2026-04-17T19:42:12.220000",
+    ticker: "$WOJAK",
+    signal_status: "STANDBY",
+    confidence_score: 0.41,
+    social_metrics: { hype_velocity: 0.32, authenticity_score: 0.61, influence_weight: 1.4, vip_triggers: [] },
+    chain_metrics: { insider_distribution_ratio: 0.22, liquidity_depth_usd: 95000, hard_veto_active: false },
+    system_warnings: []
+  },
+  vetoed: {
+    timestamp: "2026-04-17T19:40:03.772000",
+    ticker: "$RUGME",
+    signal_status: "VETOED",
+    confidence_score: 0.0,
+    social_metrics: { hype_velocity: 0.94, authenticity_score: 0.88, influence_weight: 5.6, vip_triggers: ["@VitalikButerin","@AlphaCallerX"] },
+    chain_metrics: { insider_distribution_ratio: 0.58, liquidity_depth_usd: 42000, hard_veto_active: true },
+    system_warnings: ["EXIT LIQUIDITY TRAP DETECTED: Insiders are distributing."]
+  }
+};
+
+// Live feed: starts from window.FITPAC_ALERTS (alerts.js) if present, then
+// continuously refreshed by refreshFromAPI() when served by fitpac_server.py.
+let LIVE_ALERTS = (typeof window !== 'undefined' && Array.isArray(window.FITPAC_ALERTS)) ? window.FITPAC_ALERTS : null;
+let LIVE_BY_TICKER = LIVE_ALERTS ? Object.fromEntries(LIVE_ALERTS.map(a => [a.ticker, a])) : null;
+let LAST_API_FETCH = null;   // ISO timestamp of last successful /api/alerts read
+let API_FETCH_ERROR = null;  // last network error string, cleared on success
+
+let state = {
+  mode: LIVE_ALERTS ? 'live' : 'demo',
+  scenario: 'ignition',
+  liveTicker: LIVE_ALERTS ? LIVE_ALERTS[0].ticker : null,
+  tick: 0
+};
+
+async function refreshFromAPI({ silent = false } = {}) {
+  // Only attempt when served over http(s); file:// opens skip straight to demo/alerts.js.
+  if (!/^https?:/.test(window.location.protocol)) return false;
+  try {
+    const res = await fetch('/api/alerts', { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    if (!Array.isArray(data) || !data.length) throw new Error('empty payload');
+    const prevTicker = state.liveTicker;
+    LIVE_ALERTS = data;
+    LIVE_BY_TICKER = Object.fromEntries(data.map(a => [a.ticker, a]));
+    LAST_API_FETCH = new Date().toISOString();
+    API_FETCH_ERROR = null;
+    state.mode = 'live';
+    // Preserve user's selected ticker if it still exists, else pick the top one.
+    state.liveTicker = (prevTicker && LIVE_BY_TICKER[prevTicker]) ? prevTicker : data[0].ticker;
+    state.tick++;
+    render();
+    return true;
+  } catch (err) {
+    API_FETCH_ERROR = String(err && err.message || err);
+    if (!silent) console.warn('[FITPAC] /api/alerts failed:', API_FETCH_ERROR);
+    state.tick++;
+    render();
+    return false;
+  }
+}
+
+// --- helpers ---
+const fmtUSD = n => '$' + (n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':n);
+const fmtPct = n => (n*100).toFixed(1) + '%';
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function statusStyle(st) {
+  if (st === 'VIRAL_IGNITION') return { text:'text-emerald-300', bg:'bg-emerald-500/15', ring:'ring-emerald-400/40', dot:'bg-emerald-400', label:'VIRAL IGNITION', icon:'flame' };
+  if (st === 'VETOED') return { text:'text-red-300', bg:'bg-red-500/15', ring:'ring-red-400/40', dot:'bg-red-500', label:'VETOED', icon:'skull' };
+  return { text:'text-amber-200', bg:'bg-amber-500/10', ring:'ring-amber-400/30', dot:'bg-amber-400', label:'STANDBY', icon:'radio' };
+}
+
+// Tiny inline SVG icon factory
+const I = {
+  activity: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-5 w-5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>`,
+  flame: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-5 w-5"><path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/></svg>`,
+  skull: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-5 w-5"><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><path d="M8 20v2h8v-2"/><path d="M12.5 17l-.5-1-.5 1h1z"/><path d="M16 20a2 2 0 0 0 1.56-3.25 8 8 0 1 0-11.12 0A2 2 0 0 0 8 20"/></svg>`,
+  radio: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-5 w-5"><path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9"/><path d="M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5"/><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5"/><path d="M19.1 4.9C23 8.8 23 15.1 19.1 19"/></svg>`,
+  alert: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-5 w-5"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" x2="12" y1="9" y2="13"/><line x1="12" x2="12.01" y1="17" y2="17"/></svg>`,
+  shield: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-4 w-4"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>`,
+  shieldAlert: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-4 w-4"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>`,
+  zap: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-4 w-4"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg>`,
+  trend: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-3.5 w-3.5"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg>`,
+  droplet: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-4 w-4"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/></svg>`,
+  bot: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-3 w-3"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>`,
+  check: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-3 w-3"><path d="M2.97 12.92A2 2 0 0 0 2 14.63v3.24a2 2 0 0 0 .97 1.71l3 1.8a2 2 0 0 0 2.06 0L12 19l3.97 2.38a2 2 0 0 0 2.06 0l3-1.8a2 2 0 0 0 .97-1.71v-3.24a2 2 0 0 0-.97-1.71L18 10.54V5.83a2 2 0 0 0-.97-1.71l-3-1.8a2 2 0 0 0-2.06 0L8 4.7 4.03 2.32a2 2 0 0 0-2.06 0l-3 1.8z"/><path d="m9 12 2 2 4-4"/></svg>`,
+  eye: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-3.5 w-3.5"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>`,
+  target: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-3.5 w-3.5"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>`,
+  clock: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-3.5 w-3.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`,
+  refresh: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-3.5 w-3.5"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/></svg>`,
+};
+
+function currentPayload() {
+  if (state.mode === 'live' && LIVE_BY_TICKER) return LIVE_BY_TICKER[state.liveTicker] || LIVE_ALERTS[0];
+  return PAYLOADS[state.scenario];
+}
+
+function switcherHtml() {
+  if (state.mode === 'live' && LIVE_ALERTS) {
+    const ordered = [...LIVE_ALERTS].sort((a,b) => b.confidence_score - a.confidence_score);
+    return `<div class="flex flex-wrap items-center gap-2">
+      <span class="text-[11px] uppercase tracking-widest text-slate-500 mr-1">Live Feed</span>
+      ${ordered.map(a => {
+        const active = state.liveTicker === a.ticker;
+        const ss = statusStyle(a.signal_status);
+        const tone = a.signal_status === 'VIRAL_IGNITION' ? 'emerald' : a.signal_status === 'VETOED' ? 'red' : 'amber';
+        const activeCls = tone==='emerald' ? 'bg-emerald-500/20 text-emerald-200 ring-emerald-400/40'
+                        : tone==='red' ? 'bg-red-500/20 text-red-200 ring-red-400/40'
+                        : 'bg-amber-500/20 text-amber-100 ring-amber-400/40';
+        return `<button data-ticker="${esc(a.ticker)}" class="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold ring-1 transition ${active?activeCls:'bg-slate-800/50 text-slate-400 ring-slate-700 hover:text-slate-200'}">
+          <span class="h-1.5 w-1.5 rounded-full ${ss.dot}"></span>${esc(a.ticker)}<span class="tabular-nums opacity-70">${Math.round(a.confidence_score*100)}</span>
+        </button>`;
+      }).join('')}
+    </div>`;
+  }
+  return `<div class="flex items-center gap-2">
+      ${[['ignition','Viral Ignition','emerald'],['standby','Standby','amber'],['vetoed','Vetoed Trap','red']].map(([id,label,tone]) => {
+        const active = state.scenario === id;
+        const activeCls = tone==='emerald' ? 'bg-emerald-500/20 text-emerald-200 ring-emerald-400/40'
+                        : tone==='red' ? 'bg-red-500/20 text-red-200 ring-red-400/40'
+                        : 'bg-amber-500/20 text-amber-100 ring-amber-400/40';
+        return `<button data-scenario="${id}" class="rounded-full px-4 py-1.5 text-xs font-semibold ring-1 transition ${active?activeCls:'bg-slate-800/50 text-slate-400 ring-slate-700 hover:text-slate-200'}">${label}</button>`;
+      }).join('')}
+    </div>`;
+}
+
+function render() {
+  const p = currentPayload();
+  const ss = statusStyle(p.signal_status);
+  const ts = new Date(p.timestamp);
+  let dataSrcLabel;
+  if (API_FETCH_ERROR) {
+    dataSrcLabel = `<span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ring-1 bg-red-500/10 text-red-300 ring-red-400/30">● API Offline · ${esc(API_FETCH_ERROR)}</span>`;
+  } else if (state.mode === 'live') {
+    const feedKind = LAST_API_FETCH ? 'Live API' : 'Static Feed';
+    const stamp = LAST_API_FETCH ? ` · ${new Date(LAST_API_FETCH).toLocaleTimeString()}` : '';
+    dataSrcLabel = `<span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ring-1 bg-emerald-500/10 text-emerald-300 ring-emerald-400/30">● ${feedKind} · ${LIVE_ALERTS.length} tickers${stamp}</span>`;
+  } else {
+    dataSrcLabel = `<span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ring-1 bg-slate-800/70 text-slate-300 ring-slate-600/40">Demo Mode · serve via fitpac_server.py for live data</span>`;
+  }
+
+  document.getElementById('app').innerHTML = `
+    <!-- Scenario / Ticker Switcher -->
+    <div class="mb-6 flex flex-wrap items-center justify-between gap-3">
+      ${switcherHtml()}
+      <div class="flex items-center gap-2">
+        ${dataSrcLabel}
+        <button id="refresh-btn" class="inline-flex items-center gap-2 rounded-full bg-slate-800/70 px-4 py-1.5 text-xs font-semibold text-slate-200 ring-1 ring-slate-700 hover:bg-slate-700">
+          ${I.refresh} Refresh Cycle
+        </button>
+      </div>
+    </div>
+
+    <!-- Header -->
+    <div class="flex flex-wrap items-center justify-between gap-4">
+      <div class="flex items-center gap-4">
+        <div class="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-violet-600/40 to-sky-500/30 ring-1 ring-white/10 text-sky-300">${I.activity}</div>
+        <div>
+          <div class="flex items-center gap-2 text-xs uppercase tracking-widest text-slate-400">
+            <span>FITPAC Alert Engine</span><span class="text-slate-600">•</span><span>v4.7</span>
+          </div>
+          <div class="flex items-baseline gap-3">
+            <h1 class="text-3xl font-black text-white">${esc(p.ticker)}</h1>
+            <span class="text-sm text-slate-400">${ts.toUTCString().replace('GMT','UTC')}</span>
+          </div>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        ${p.chain_metrics.chain_data_missing ? `
+          <div class="flex items-center gap-2 rounded-2xl px-3.5 py-3 ring-1 bg-amber-500/10 ring-amber-400/40 text-amber-200">
+            ${I.shieldAlert}<span class="text-xs font-bold tracking-wider uppercase">Chain Unverified</span>
+          </div>` : ''}
+        <div class="flex items-center gap-3 rounded-2xl px-5 py-3 ring-1 ${ss.bg} ${ss.ring}">
+          <span class="relative flex h-3 w-3">
+            <span class="absolute inline-flex h-full w-full animate-ping rounded-full opacity-75 ${ss.dot}"></span>
+            <span class="relative inline-flex h-3 w-3 rounded-full ${ss.dot}"></span>
+          </span>
+          <span class="${ss.text}">${I[ss.icon]}</span>
+          <span class="text-sm font-bold tracking-wider ${ss.text}">${ss.label}</span>
+        </div>
+      </div>
+    </div>
+
+    ${p.chain_metrics.hard_veto_active ? `
+      <div class="mt-6 flex items-start gap-4 rounded-2xl border border-red-500/40 bg-gradient-to-r from-red-950/70 via-red-900/30 to-red-950/70 p-5 shadow-lg shadow-red-900/20">
+        <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-red-500/20 ring-1 ring-red-400/40 text-red-300">${I.alert}</div>
+        <div class="flex-1">
+          <div class="flex items-center gap-2">
+            <span class="text-sm font-bold uppercase tracking-widest text-red-300">Hard Veto Active</span>
+            <span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 bg-red-500/10 text-red-300 ring-red-400/30">${I.shieldAlert} FITPAC Protocol Engaged</span>
+          </div>
+          ${p.system_warnings.map(w => `<p class="mt-1 text-sm text-red-100/90">${esc(w)}</p>`).join('')}
+        </div>
+      </div>` : p.chain_metrics.chain_data_missing ? `
+      <div class="mt-6 flex items-start gap-4 rounded-2xl border border-amber-500/40 bg-gradient-to-r from-amber-950/70 via-amber-900/30 to-amber-950/70 p-5 shadow-lg shadow-amber-900/20">
+        <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-500/20 ring-1 ring-amber-400/40 text-amber-200">${I.shieldAlert}</div>
+        <div class="flex-1">
+          <div class="flex items-center gap-2">
+            <span class="text-sm font-bold uppercase tracking-widest text-amber-200">Chain Data Unverified</span>
+            <span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 bg-amber-500/10 text-amber-200 ring-amber-400/30">${I.shieldAlert} TAO Rule · Ignition Suppressed</span>
+          </div>
+          ${p.system_warnings.map(w => `<p class="mt-1 text-sm text-amber-100/90">${esc(w)}</p>`).join('')}
+        </div>
+      </div>` : ''}
+
+    <!-- Main Grid -->
+    <div class="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
+      ${confidenceCard(p)}
+      ${velocityCard(p)}
+      ${socialCard(p)}
+      ${chainCard(p)}
+      ${auditCard(p)}
+      <div class="lg:col-span-3">${jsonCard(p)}</div>
+    </div>
+
+    <footer class="mt-10 flex flex-wrap items-center justify-between gap-3 text-[11px] uppercase tracking-widest text-slate-500">
+      <span>FITPAC Alert Engine · UI Payload Consumer</span>
+      <span>No Kelly · No Dynamic Sizing · Signal-Only Mode</span>
+    </footer>
+  `;
+
+  // wire up buttons
+  document.querySelectorAll('[data-scenario]').forEach(el => {
+    el.addEventListener('click', () => { state.scenario = el.dataset.scenario; state.tick++; render(); });
+  });
+  document.querySelectorAll('[data-ticker]').forEach(el => {
+    el.addEventListener('click', () => { state.liveTicker = el.dataset.ticker; state.tick++; render(); });
+  });
+  document.getElementById('refresh-btn').addEventListener('click', () => {
+    // In live mode, hit the API; otherwise just re-render animations.
+    if (/^https?:/.test(window.location.protocol)) {
+      refreshFromAPI();
+    } else {
+      state.tick++;
+      render();
+    }
+  });
+}
+
+function confidenceCard(p) {
+  const pct = Math.round(p.confidence_score * 100);
+  const color = p.signal_status==='VETOED' ? '#ef4444' : p.signal_status==='VIRAL_IGNITION' ? '#10b981' : '#f59e0b';
+  const r = 80, c = 2*Math.PI*r;
+  const start = 220, end = -40;
+  const sweep = (start - end) / 360 * c;
+  const filled = sweep * (pct / 100);
+  const off = sweep - filled;
+  return `
+  <div class="rounded-2xl border border-white/5 bg-slate-900/60 backdrop-blur-md shadow-2xl shadow-black/30 p-5 lg:col-span-1">
+    <div class="flex items-center justify-between">
+      <div class="flex items-center gap-2 text-xs uppercase tracking-widest text-slate-400">${I.target}<span>Pump Probability</span></div>
+      <span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 bg-slate-800/70 text-slate-200 ring-slate-600/40">GBDT Ensemble</span>
+    </div>
+    <div class="relative mt-2 flex h-56 items-center justify-center">
+      <svg viewBox="0 0 200 200" class="h-full w-full -rotate-[20deg]">
+        <circle cx="100" cy="100" r="${r}" fill="none" stroke="#1e293b" stroke-width="18" stroke-linecap="round"
+                stroke-dasharray="${sweep} ${c}" transform="rotate(-110 100 100)"/>
+        <circle cx="100" cy="100" r="${r}" fill="none" stroke="${color}" stroke-width="18" stroke-linecap="round"
+                stroke-dasharray="${filled} ${c}" transform="rotate(-110 100 100)" class="gauge-fill"
+                style="--len:${sweep}; --off:${off};"/>
+      </svg>
+      <div class="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
+        <div class="text-5xl font-black text-white tabular-nums">${pct}</div>
+        <div class="text-xs uppercase tracking-widest text-slate-400">Confidence</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function velocityCard(p) {
+  // Generate deterministic mock bars
+  const seed = state.tick + (state.scenario==='ignition'?1:state.scenario==='vetoed'?7:3);
+  const base = p.social_metrics.hype_velocity;
+  const bars = Array.from({length: 24}, (_,i) => {
+    const noise = (Math.sin(seed*9.3 + i*2.1) + 1)/2;
+    const drift = 0.7 + 0.3 * Math.sin(i*0.4);
+    return Math.max(0.05, Math.min(1, base * drift * 0.7 + noise * 0.35));
+  });
+  return `
+  <div class="rounded-2xl border border-white/5 bg-slate-900/60 backdrop-blur-md shadow-2xl shadow-black/30 p-5 lg:col-span-2">
+    <div class="mb-3 flex items-center justify-between">
+      <div class="flex items-center gap-2 text-xs uppercase tracking-widest text-slate-400">${I.trend}<span>Hype Velocity — Last 24 Ticks</span></div>
+      <span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 bg-violet-500/10 text-violet-300 ring-violet-400/30">Streaming</span>
+    </div>
+    <div class="flex h-40 items-end gap-1.5">
+      ${bars.map((v,i) => `<div class="flex-1 bar-rise rounded-t-md bg-gradient-to-t from-violet-600/40 to-fuchsia-400" style="height:${Math.round(v*100)}%; animation-delay:${i*30}ms"></div>`).join('')}
+    </div>
+  </div>`;
+}
+
+function metricBar(label, value, iconSvg, tone, subtitle) {
+  const toneMap = {
+    sky:'from-sky-500 to-cyan-400', emerald:'from-emerald-500 to-teal-400',
+    violet:'from-violet-500 to-fuchsia-400', amber:'from-amber-500 to-orange-400', red:'from-red-500 to-rose-400'
+  };
+  const pct = Math.min(100, Math.max(0, value*100));
+  return `
+  <div>
+    <div class="mb-1.5 flex items-center justify-between">
+      <div class="flex items-center gap-2 text-xs text-slate-400">${iconSvg}<span class="uppercase tracking-widest">${label}</span></div>
+      <div class="text-sm font-bold text-white tabular-nums">${fmtPct(value)}</div>
+    </div>
+    <div class="h-2 overflow-hidden rounded-full bg-slate-800/70 ring-1 ring-white/5">
+      <div class="h-full rounded-full bg-gradient-to-r ${toneMap[tone]}" style="width:${pct}%"></div>
+    </div>
+    ${subtitle?`<div class="mt-1 text-[11px] text-slate-500">${subtitle}</div>`:''}
+  </div>`;
+}
+
+function socialCard(p) {
+  const s = p.social_metrics;
+  const authLow = s.authenticity_score < 0.3;
+  const authPill = authLow
+    ? `<span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 bg-red-500/10 text-red-300 ring-red-400/30">${I.bot} Bot Swarm</span>`
+    : `<span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 bg-emerald-500/10 text-emerald-300 ring-emerald-400/30">${I.check} Authentic</span>`;
+  const vipBadges = s.vip_triggers.length
+    ? s.vip_triggers.map(v => `<span class="inline-flex items-center gap-1.5 rounded-full bg-gradient-to-r from-sky-500/20 to-violet-500/20 px-3 py-1 text-xs font-semibold text-white ring-1 ring-sky-400/40">${I.check}${esc(v)}</span>`).join('')
+    : `<span class="text-xs text-slate-500">No VIP accounts detected in stream</span>`;
+  return `
+  <div class="rounded-2xl border border-white/5 bg-slate-900/60 backdrop-blur-md shadow-2xl shadow-black/30 p-5">
+    <div class="mb-4 flex items-center justify-between">
+      <div class="flex items-center gap-2">
+        <div class="flex h-8 w-8 items-center justify-center rounded-lg bg-sky-500/15 ring-1 ring-sky-400/30 text-sky-300">${I.zap}</div>
+        <h3 class="text-sm font-bold uppercase tracking-widest text-slate-200">Social Transformer</h3>
+      </div>
+      ${authPill}
+    </div>
+    <div class="space-y-4">
+      ${metricBar('Hype Velocity', s.hype_velocity, I.trend, 'violet', 'Rate of viral mention acceleration')}
+      ${metricBar('Authenticity', s.authenticity_score, I.shield, authLow?'red':'emerald', '1.0 = fully organic • <0.3 = bot-filtered')}
+      <div>
+        <div class="mb-1.5 flex items-center justify-between">
+          <div class="flex items-center gap-2 text-xs text-slate-400">${I.flame}<span class="uppercase tracking-widest">Influence Weight</span></div>
+          <div class="text-sm font-bold text-white tabular-nums">×${s.influence_weight.toFixed(2)}</div>
+        </div>
+        <div class="text-[11px] text-slate-500">VIP multiplier × dynamic fire score</div>
+      </div>
+      <div>
+        <div class="mb-2 flex items-center gap-2 text-xs uppercase tracking-widest text-slate-400">${I.eye}<span>VIP Triggers</span></div>
+        <div class="flex flex-wrap gap-2">${vipBadges}</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function chainCard(p) {
+  const c = p.chain_metrics;
+  const distTone = c.insider_distribution_ratio > 0.4 ? 'red' : c.insider_distribution_ratio > 0.25 ? 'amber' : 'emerald';
+  const liqLabel = c.liquidity_depth_usd < 50000 ? 'Thin' : c.liquidity_depth_usd < 150000 ? 'Moderate' : 'Deep';
+  const liqTone  = c.liquidity_depth_usd < 50000 ? 'red'  : c.liquidity_depth_usd < 150000 ? 'amber'    : 'emerald';
+  const toneCls = { emerald:'bg-emerald-500/10 text-emerald-300 ring-emerald-400/30', amber:'bg-amber-500/10 text-amber-200 ring-amber-400/30', red:'bg-red-500/10 text-red-300 ring-red-400/30' };
+  const vetoPill = c.chain_data_missing
+    ? `<span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 bg-amber-500/10 text-amber-200 ring-amber-400/30">${I.shieldAlert} Unverified</span>`
+    : c.hard_veto_active
+      ? `<span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 bg-red-500/10 text-red-300 ring-red-400/30">${I.shieldAlert} Veto</span>`
+      : `<span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 bg-emerald-500/10 text-emerald-300 ring-emerald-400/30">${I.shield} Clear</span>`;
+
+  // When chain data is missing, render a simplified "Unverified" state
+  // instead of showing misleading zeros for insider/liquidity/veto.
+  if (c.chain_data_missing) {
+    return `
+    <div class="rounded-2xl border border-white/5 bg-slate-900/60 backdrop-blur-md shadow-2xl shadow-black/30 p-5">
+      <div class="mb-4 flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <div class="flex h-8 w-8 items-center justify-center rounded-lg bg-amber-500/15 ring-1 ring-amber-400/30 text-amber-200">${I.droplet}</div>
+          <h3 class="text-sm font-bold uppercase tracking-widest text-slate-200">On-Chain Veto Engine</h3>
+        </div>
+        ${vetoPill}
+      </div>
+      <div class="rounded-xl border border-amber-500/30 bg-amber-950/30 p-5">
+        <div class="flex items-start gap-3">
+          <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-500/20 ring-1 ring-amber-400/40 text-amber-200">${I.shieldAlert}</div>
+          <div>
+            <div class="text-sm font-bold uppercase tracking-widest text-amber-200">No DEX Snapshot</div>
+            <p class="mt-1 text-xs text-amber-100/80 leading-relaxed">
+              Insider distribution, liquidity depth, and hard-veto state cannot be computed
+              because no on-chain snapshot was captured for this ticker. Per the TAO rule,
+              ignition is suppressed until chain-flow data is available (e.g. via a CEX
+              adapter or dedicated L1 indexer).
+            </p>
+          </div>
+        </div>
+      </div>
+      <div class="mt-4 grid grid-cols-3 gap-2 text-[11px] uppercase tracking-widest">
+        <div class="rounded-lg border border-white/5 bg-slate-950/50 p-3 text-slate-500"><div class="text-slate-400">Insider</div><div class="mt-1 text-slate-600">—</div></div>
+        <div class="rounded-lg border border-white/5 bg-slate-950/50 p-3 text-slate-500"><div class="text-slate-400">Liquidity</div><div class="mt-1 text-slate-600">—</div></div>
+        <div class="rounded-lg border border-white/5 bg-slate-950/50 p-3 text-slate-500"><div class="text-slate-400">Veto</div><div class="mt-1 text-slate-600">—</div></div>
+      </div>
+    </div>`;
+  }
+
+  return `
+  <div class="rounded-2xl border border-white/5 bg-slate-900/60 backdrop-blur-md shadow-2xl shadow-black/30 p-5">
+    <div class="mb-4 flex items-center justify-between">
+      <div class="flex items-center gap-2">
+        <div class="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-500/15 ring-1 ring-emerald-400/30 text-emerald-300">${I.droplet}</div>
+        <h3 class="text-sm font-bold uppercase tracking-widest text-slate-200">On-Chain Veto Engine</h3>
+      </div>
+      ${vetoPill}
+    </div>
+    <div class="space-y-4">
+      ${metricBar('Insider Distribution', c.insider_distribution_ratio, I.skull || I.alert, distTone, 'Veto triggered above 40%')}
+      <div class="rounded-xl border border-white/5 bg-slate-950/50 p-4">
+        <div class="flex items-center justify-between">
+          <div>
+            <div class="flex items-center gap-2 text-xs uppercase tracking-widest text-slate-400">${I.droplet}<span>Liquidity Depth</span></div>
+            <div class="mt-1 text-2xl font-black text-white tabular-nums">${fmtUSD(c.liquidity_depth_usd)}</div>
+          </div>
+          <span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 ${toneCls[liqTone]}">${liqLabel}</span>
+        </div>
+      </div>
+      <div class="rounded-xl border p-4 ${c.hard_veto_active?'border-red-500/30 bg-red-950/30':'border-emerald-500/20 bg-emerald-950/20'}">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-2 text-xs uppercase tracking-widest text-slate-400">
+            <span class="${c.hard_veto_active?'text-red-300':'text-emerald-300'}">${c.hard_veto_active?I.shieldAlert:I.shield}</span>
+            <span>Hard Veto State</span>
+          </div>
+          <span class="text-sm font-bold ${c.hard_veto_active?'text-red-300':'text-emerald-300'}">${c.hard_veto_active?'ACTIVE':'INACTIVE'}</span>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function auditCard(p) {
+  const lines = [
+    `[INFO] Running backend cycle for ${p.ticker}...`,
+    `[INFO] Social stream processed: hype_velocity=${p.social_metrics.hype_velocity.toFixed(2)}, authenticity=${p.social_metrics.authenticity_score.toFixed(2)}`,
+    `[INFO] VIP triggers resolved: ${p.social_metrics.vip_triggers.length?p.social_metrics.vip_triggers.join(', '):'(none)'}`,
+    `[INFO] Chain veto state: ${p.chain_metrics.hard_veto_active?'ACTIVE':'INACTIVE'} (insider_dist=${fmtPct(p.chain_metrics.insider_distribution_ratio)})`,
+  ];
+  if (p.chain_metrics.hard_veto_active) lines.push('[ERROR] Trap_Evaded: High social hype + insider distribution. VETOED.');
+  lines.push(`[INFO] Confidence emitted: ${p.confidence_score.toFixed(3)} → signal_status=${p.signal_status}`);
+  return `
+  <div class="rounded-2xl border border-white/5 bg-slate-900/60 backdrop-blur-md shadow-2xl shadow-black/30 p-5">
+    <div class="mb-3 flex items-center justify-between">
+      <div class="flex items-center gap-2 text-xs uppercase tracking-widest text-slate-400">${I.clock}<span>FITPAC Audit Log</span></div>
+      <span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 bg-slate-800/70 text-slate-200 ring-slate-600/40">Compliance Trace</span>
+    </div>
+    <div class="overflow-hidden rounded-xl border border-white/5 bg-black/60 p-4 font-mono text-[12px] leading-relaxed">
+      ${lines.map(l => {
+        const isErr = l.includes('[ERROR]');
+        return `<div class="${isErr?'text-red-300':'text-emerald-300/90'}"><span class="text-slate-500">FITPAC_EMIT:</span> ${esc(l)}</div>`;
+      }).join('')}
+    </div>
+  </div>`;
+}
+
+function jsonCard(p) {
+  return `
+  <div class="rounded-2xl border border-white/5 bg-slate-900/60 backdrop-blur-md shadow-2xl shadow-black/30 p-5">
+    <div class="mb-3 flex items-center justify-between">
+      <div class="flex items-center gap-2 text-xs uppercase tracking-widest text-slate-400">${I.activity}<span>Raw UI Payload</span></div>
+      <span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 bg-sky-500/10 text-sky-300 ring-sky-400/30">backend → ui</span>
+    </div>
+    <pre class="max-h-72 overflow-auto rounded-xl border border-white/5 bg-black/60 p-4 font-mono text-[11px] leading-relaxed text-slate-300">${esc(JSON.stringify(p, null, 2))}</pre>
+  </div>`;
+}
+
+// Initial paint uses whatever we have (alerts.js or demo mode).
+render();
+// Try to upgrade to the live API feed. Silent on boot so file:// opens don't log warnings.
+refreshFromAPI({ silent: true });
+// Animation tick for gauge/bars (cheap, client-only).
+setInterval(() => { state.tick++; render(); }, 5000);
+// Poll the backend every 60s. If it fails, the red "API Offline" pill shows why.
+setInterval(() => { refreshFromAPI({ silent: true }); }, 60000);
+</script>
+</body>
+</html>

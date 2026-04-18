@@ -1,0 +1,43 @@
+# Fly.io deployment config for FITPAC.
+# Usage:
+#   fly launch --no-deploy              # first-time only — creates the app
+#   fly volumes create fitpac_data --size 1 --region iad   # 1GB persistent SQLite
+#   fly deploy
+#
+# After the first deploy, the dashboard is at https://<app-name>.fly.dev
+
+app = "fitpac-dashboard"   # ← change to your unique app name
+primary_region = "iad"     # Ashburn, VA (lowest latency to DexScreener)
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  FITPAC_REFRESH_MIN = "10"   # run scrape+analyze every 10 minutes
+
+[[mounts]]
+  source = "fitpac_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"   # keep the refresh loop alive
+  auto_start_machines = true
+  min_machines_running = 1     # one always-on machine is enough for read-only
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 250
+    soft_limit = 200
+
+[[services.tcp_checks]]
+  interval = "15s"
+  timeout = "2s"
+  grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  cpus = 1
