@@ -210,6 +210,20 @@ def latest_chain_snapshot(ticker: str) -> Optional[sqlite3.Row]:
         ).fetchone()
 
 
+def update_ticker_address(ticker: str, chain: str, token_address: str) -> None:
+    """Persist a newly-resolved on-chain address for `ticker`.
+
+    Called by DexScreenerResolver the first time a ticker's address is
+    discovered via /search, so subsequent cycles skip straight to the
+    /tokens/{addr} fast path.
+    """
+    with connect() as conn:
+        conn.execute(
+            "UPDATE tickers SET chain=?, token_address=? WHERE ticker=?",
+            (chain, token_address, ticker),
+        )
+
+
 # ---- Write helpers --------------------------------------------------------
 def upsert_post(post: Dict) -> None:
     """post keys: id, platform, ticker, author, text, permalink, timestamp, engagement, bot_flag"""

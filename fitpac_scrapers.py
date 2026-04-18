@@ -101,14 +101,14 @@ class DexScreenerScraper:
                 best_liq = liq
         return best
 
-    def snapshot(self, ticker: str, token_address: str, chain: str) -> Optional[Dict]:
-        """Build a chain_snapshots row from DexScreener data."""
-        pairs = self.fetch(token_address)
-        pair = self._best_pair(pairs)
-        if not pair:
-            logger.info(f"{ticker} | no DexScreener pairs returned.")
-            return None
+    @staticmethod
+    def pair_to_snapshot(ticker: str, chain: str, pair: dict) -> Dict:
+        """Turn a DexScreener pair dict into a chain_snapshots row.
 
+        Split out so both the direct address lookup path and the
+        DexScreenerResolver (search-by-symbol) path can reuse the same
+        pair → snapshot conversion logic.
+        """
         now = datetime.now(timezone.utc).replace(microsecond=0)
         created_ms = pair.get("pairCreatedAt")
         age_hours = (now.timestamp() - created_ms / 1000) / 3600 if created_ms else None
@@ -140,6 +140,110 @@ class DexScreenerScraper:
             "lp_locked": 0,  # DexScreener doesn't expose this; set via Etherscan/Solscan scraper
             "raw_json": json.dumps(pair)[:8000],
         }
+
+    def snapshot(self, ticker: str, token_address: str, chain: str) -> Optional[Dict]:
+        """Build a chain_snapshots row from DexScreener data."""
+        pairs = self.fetch(token_address)
+        pair = self._best_pair(pairs)
+        if not pair:
+            logger.info(f"{ticker} | no DexScreener pairs returned.")
+            return None
+        return self.pair_to_snapshot(ticker, chain, pair)
+
+
+# ---------------------------------------------------------------------------
+# DexScreener Resolver — auto-discover token_address by ticker symbol
+# ---------------------------------------------------------------------------
+# Why this exists:
+#   On Render/Fly/Heroku egress IPs, the /latest/dex/tokens/{addr} endpoint
+#   sometimes returns empty pairs (likely intermittent rate limiting), which
+#   causes the primary scrape to fail and the backend to mark the ticker as
+#   CHAIN UNVERIFIED — capping confidence at ~0.40 and suppressing ignition.
+#
+# The /search?q= endpoint is a different code path that (empirically) behaves
+# more forgivingly from cloud IPs. It also returns the full pair dict inline,
+# so even if /tokens/{addr} keeps failing we can still emit a snapshot.
+#
+# Resolved addresses are persisted back to the tickers table so the search
+# cost is paid at most once per ticker per container lifetime.
+# ---------------------------------------------------------------------------
+class DexScreenerResolver:
+    SEARCH = "https://api.dexscreener.com/latest/dex/search?q={query}"
+
+    # Pools below this liquidity floor are almost always scammer squats on a
+    # popular symbol. We skip them to avoid polluting the snapshot with noise.
+    MIN_LIQUIDITY_USD = 50_000
+
+    # DexScreener chainId → our internal chain name. Most are identity mappings;
+    # listed explicitly so the set of allowed chains is reviewable at a glance.
+    CHAIN_MAP = {
+        "ethereum":  "ethereum",
+        "solana":    "solana",
+        "base":      "base",
+        "bsc":       "bsc",
+        "polygon":   "polygon",
+        "arbitrum":  "arbitrum",
+        "optimism":  "optimism",
+        "moonriver": "moonriver",
+        "blast":     "blast",
+        "avalanche": "avalanche",
+        "fantom":    "fantom",
+        "sui":       "sui",
+        "ton":       "ton",
+    }
+
+    def resolve(self, ticker: str, hint_chain: Optional[str] = None) -> Optional[Dict]:
+        """Search DexScreener for `ticker` and return the best matching pool.
+
+        Returns: dict(chain, token_address, pair) or None.
+        Best-effort — returns None on HTTP error, no matches, or low liquidity.
+        """
+        symbol = ticker.lstrip("$").upper()
+        if not symbol:
+            return None
+
+        try:
+            data = _http_get(self.SEARCH.format(query=urllib.parse.quote(symbol)))
+        except urllib.error.URLError as e:
+            logger.warning(f"DexScreener search failed for {ticker}: {e}")
+            return None
+
+        pairs = data.get("pairs") or []
+        # Symbol must match the baseToken exactly (case-insensitive), AND the
+        # pool must clear the minimum liquidity floor.
+        candidates = [
+            p for p in pairs
+            if (p.get("baseToken") or {}).get("symbol", "").upper() == symbol
+            and ((p.get("liquidity") or {}).get("usd") or 0) >= self.MIN_LIQUIDITY_USD
+        ]
+        if not candidates:
+            logger.info(
+                f"{ticker} | DexScreener search returned no pairs ≥ "
+                f"${self.MIN_LIQUIDITY_USD:,.0f} liquidity."
+            )
+            return None
+
+        # Prefer the hinted chain if we have one (from the seeded DB row)
+        if hint_chain:
+            preferred_id = self.CHAIN_MAP.get(hint_chain, hint_chain)
+            on_hint = [p for p in candidates if p.get("chainId") == preferred_id]
+            if on_hint:
+                candidates = on_hint
+
+        # Deepest liquidity wins
+        best = max(candidates, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
+        chain_id = best.get("chainId") or "unknown"
+        chain_name = self.CHAIN_MAP.get(chain_id, chain_id)
+        base = best.get("baseToken") or {}
+        addr = base.get("address")
+        if not addr:
+            return None
+
+        logger.info(
+            f"{ticker} | resolved via /search → chain={chain_name} "
+            f"addr={addr[:10]}… liq=${(best.get('liquidity') or {}).get('usd', 0):,.0f}"
+        )
+        return {"chain": chain_name, "token_address": addr, "pair": best}
 
 
 # ---------------------------------------------------------------------------
@@ -737,25 +841,63 @@ class BotFilter:
 # High-level runners
 # ---------------------------------------------------------------------------
 def scrape_chain_all() -> int:
-    """Fetch a fresh chain snapshot for every enabled ticker. Returns # written."""
+    """Fetch a fresh chain snapshot for every enabled ticker. Returns # written.
+
+    Fallback order per ticker:
+      1. Hyperliquid spot (for $HYPE and friends)
+      2. DexScreener /tokens/{addr}    — fast path, uses seeded address
+      3. DexScreener /search?q={sym}   — resolver fallback; also self-heals
+                                         stale/wrong addresses and persists
+                                         the fix back to the tickers table
+      4. CoinGecko /coins/{id}         — for non-DEX assets ($DOGE, $TAO)
+    """
     dex = DexScreenerScraper()
     cg = CoinGeckoScraper()
     hl = HyperliquidScraper()
+    resolver = DexScreenerResolver()
     written = 0
     for row in db.list_tickers():
         snap = None
+        ticker = row["ticker"]
+        chain = row["chain"]
+
         # Hyperliquid-native spot assets: coin name lives in token_address slot.
-        if row["chain"] == "hyperliquid" and row["token_address"]:
-            snap = hl.snapshot(row["ticker"], row["token_address"])
-        elif row["token_address"]:
-            snap = dex.snapshot(row["ticker"], row["token_address"], row["chain"])
+        if chain == "hyperliquid" and row["token_address"]:
+            snap = hl.snapshot(ticker, row["token_address"])
+        else:
+            # Fast path: use the seeded on-chain address
+            if row["token_address"]:
+                snap = dex.snapshot(ticker, row["token_address"], chain)
+
+            # Resolver fallback: if the seeded address returned no pairs (or
+            # there's no seeded address at all), search DexScreener by symbol.
+            if snap is None and chain != "hyperliquid":
+                resolved = resolver.resolve(ticker, hint_chain=chain)
+                if resolved:
+                    # The resolver already has the pair data — build a snapshot
+                    # directly from it rather than paying for a second HTTP call.
+                    snap = DexScreenerScraper.pair_to_snapshot(
+                        ticker, resolved["chain"], resolved["pair"]
+                    )
+                    # Persist the resolved address so next cycle skips the search.
+                    try:
+                        db.update_ticker_address(
+                            ticker, resolved["chain"], resolved["token_address"]
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            f"{ticker} | failed to persist resolved address: {exc}"
+                        )
+
+        # Last-resort: CoinGecko for non-DEX assets
         if snap is None and row["coingecko_id"]:
-            snap = cg.snapshot(row["ticker"], row["coingecko_id"], row["chain"])
+            snap = cg.snapshot(ticker, row["coingecko_id"], chain)
+
         if snap:
             db.insert_chain_snapshot(snap)
             written += 1
             logger.info(
-                f"{row['ticker']:<10} | liq=${snap['liquidity_depth_usd']:,.0f} "
+                f"{ticker:<10} | liq=${snap['liquidity_depth_usd']:,.0f} "
                 f"| sells_1h={snap['txns_1h_sells']} | insider_proxy={snap['insider_distribution_ratio']}"
             )
         time.sleep(0.3)  # polite throttle for DexScreener
