@@ -14,6 +14,7 @@ All scrapers use stdlib urllib — zero pip installs required.
 
 import json
 import logging
+import os
 import re
 import time
 import urllib.request
@@ -28,7 +29,16 @@ import fitpac_db as db
 
 logger = logging.getLogger("FITPAC_Scrapers")
 
-USER_AGENT = "FITPAC-Alert-Engine/1.0 (+https://fitpac.local/bot)"
+# Reddit's public API requires a descriptive User-Agent in the format
+#   <platform>:<app ID>:<version> (by /u/<reddit-username>)
+# Generic UAs and anything containing "bot" or ".local" are rate-limited
+# aggressively — especially on cloud/shared IPs (Render, Fly, Heroku).
+# Override at deploy time via env var FITPAC_USER_AGENT if you have a real
+# Reddit handle you'd rather attribute.
+USER_AGENT = os.environ.get(
+    "FITPAC_USER_AGENT",
+    "linux:fitpac-alert-engine:v1.0 (by /u/jamesnobleroots-oss)",
+)
 HTTP_TIMEOUT = 15
 
 # Default subreddits to sweep for ticker mentions
@@ -48,12 +58,18 @@ TICKER_RE = re.compile(r"\$([A-Z][A-Z0-9]{1,9})\b")
 # HTTP helper
 # ---------------------------------------------------------------------------
 def _http_get(url: str, extra_headers: Optional[Dict[str, str]] = None) -> dict:
+    """GET url, parse JSON. Re-raises URLError/HTTPError with status for log visibility."""
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     if extra_headers:
         headers.update(extra_headers)
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
-        return json.loads(r.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        # Surface the HTTP status so the Render log tab shows 403/429 clearly.
+        logger.warning(f"HTTP {e.code} on {url}: {e.reason}")
+        raise urllib.error.URLError(f"HTTP {e.code} {e.reason}") from e
 
 
 # ---------------------------------------------------------------------------
