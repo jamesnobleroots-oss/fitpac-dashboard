@@ -605,10 +605,70 @@ class CoinGeckoTrendingScraper:
     watchlist hit, with count proportional to CoinGecko's internal trending
     score. Low score = hot → more synthetic posts. This drives
     SocialTransformerModule's recent-vs-prior window comparison, so a coin
-    entering the trending list produces a real hype_velocity bump."""
+    entering the trending list produces a real hype_velocity bump.
+
+    Also auto-ingests new trending coins into the watchlist so FITPAC
+    self-discovers emerging tickers without manual curation. See `_autoingest`.
+    """
 
     BASE = "https://api.coingecko.com/api/v3/search/trending"
     AUTHOR = "u/coingecko_trending"
+
+    # Hard cap on total watchlist size. Each ticker adds ~0.3s of DexScreener
+    # throttle + a resolver HTTP call, so at 60 the full chain scrape stays
+    # under ~30s — well within Render's request budget.
+    MAX_WATCHLIST_SIZE = 60
+
+    # Screen out scammer clones: CoinGecko assigns market_cap_rank only to
+    # coins with a verified exchange listing. Anything beyond this rank (or
+    # missing a rank entirely) is skipped.
+    MAX_MARKET_CAP_RANK = 10_000
+
+    def _autoingest(self, coins: List[dict]) -> int:
+        """Add any trending coin not already on the watchlist, up to cap.
+
+        Inserted rows have chain='unknown' and token_address=NULL — the
+        DexScreenerResolver fills both in on the next chain scrape cycle.
+        """
+        try:
+            current_count = db.count_tickers()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Auto-ingest: count_tickers failed — skipping: {e}")
+            return 0
+
+        added = 0
+        for coin in coins:
+            if current_count + added >= self.MAX_WATCHLIST_SIZE:
+                logger.info(
+                    f"Auto-ingest cap reached ({self.MAX_WATCHLIST_SIZE} tickers); "
+                    "skipping remaining trending coins."
+                )
+                break
+            item = coin.get("item") or {}
+            symbol = (item.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            ticker = f"${symbol}"
+            rank = item.get("market_cap_rank")
+            if rank is None or rank > self.MAX_MARKET_CAP_RANK:
+                continue
+            try:
+                inserted = db.insert_ticker_if_new(
+                    ticker=ticker,
+                    chain="unknown",  # resolver will overwrite on first chain scrape
+                    coingecko_id=item.get("id"),
+                    display_name=item.get("name") or symbol,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Auto-ingest: insert {ticker} failed: {e}")
+                continue
+            if inserted:
+                logger.info(
+                    f"Auto-ingested {ticker} (rank={rank}, cg_id={item.get('id')}) "
+                    "— resolver will map chain address next cycle."
+                )
+                added += 1
+        return added
 
     def scrape(self, watchlist_tickers: List[str]) -> List[Dict]:
         try:
@@ -618,6 +678,12 @@ class CoinGeckoTrendingScraper:
             return []
 
         coins = data.get("coins") or []
+
+        # Auto-grow the watchlist from trending before we build the hit set,
+        # so newly-added tickers get synthetic posts emitted THIS cycle.
+        if self._autoingest(coins):
+            watchlist_tickers = [r["ticker"] for r in db.list_tickers()]
+
         watchset = {t.upper() for t in watchlist_tickers}
         out: List[Dict] = []
         now = datetime.now(timezone.utc).replace(microsecond=0)

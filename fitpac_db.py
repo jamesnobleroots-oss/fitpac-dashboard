@@ -224,6 +224,43 @@ def update_ticker_address(ticker: str, chain: str, token_address: str) -> None:
         )
 
 
+def count_tickers(enabled_only: bool = True) -> int:
+    """Return the current number of watchlist entries.
+
+    Used by the CoinGecko auto-ingest to enforce MAX_WATCHLIST_SIZE and keep
+    per-cycle scrape times bounded as trending tickers flow in.
+    """
+    with connect() as conn:
+        q = "SELECT COUNT(*) AS n FROM tickers"
+        if enabled_only:
+            q += " WHERE enabled=1"
+        return conn.execute(q).fetchone()["n"]
+
+
+def insert_ticker_if_new(
+    ticker: str,
+    chain: str,
+    coingecko_id: Optional[str],
+    display_name: str,
+) -> bool:
+    """Insert a new watchlist entry; return True if it was actually added.
+
+    Used by the CoinGecko trending auto-ingest path. Newly-inserted tickers
+    get `token_address=NULL` — the DexScreenerResolver will populate both the
+    chain name and the address on the very next chain scrape cycle.
+    """
+    with connect() as conn:
+        cur = conn.execute("SELECT 1 FROM tickers WHERE ticker=? LIMIT 1", (ticker,))
+        if cur.fetchone():
+            return False
+        conn.execute(
+            "INSERT INTO tickers(ticker,chain,token_address,coingecko_id,display_name) "
+            "VALUES(?,?,?,?,?)",
+            (ticker, chain, None, coingecko_id, display_name),
+        )
+        return True
+
+
 # ---- Write helpers --------------------------------------------------------
 def upsert_post(post: Dict) -> None:
     """post keys: id, platform, ticker, author, text, permalink, timestamp, engagement, bot_flag"""
