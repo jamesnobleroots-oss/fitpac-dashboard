@@ -1,13 +1,13 @@
 """
 FITPAC Scrapers — real live data sources, no API keys required
 ==============================================================
-  - DexScreenerScraper : market/liquidity data for EVM + Solana tokens
-                         endpoint: https://api.dexscreener.com/latest/dex/tokens/{addr}
-  - CoinGeckoScraper   : price/volume fallback for non-contract coins (DOGE, etc)
-                         endpoint: https://api.coingecko.com/api/v3/coins/{id}
-  - RedditScraper      : organic social mentions from crypto subreddits
-                         endpoint: https://www.reddit.com/r/{sub}/new.json
-  - BotFilter          : heuristic flagger (short + low-engagement + duplicate text)
+- DexScreenerScraper : market/liquidity data for EVM + Solana tokens
+endpoint: https://api.dexscreener.com/latest/dex/tokens/{addr}
+- CoinGeckoScraper : price/volume fallback for non-contract coins (DOGE, etc)
+endpoint: https://api.coingecko.com/api/v3/coins/{id}
+- RedditScraper : organic social mentions from crypto subreddits
+endpoint: https://www.reddit.com/r/{sub}/new.json
+- BotFilter : heuristic flagger (short + low-engagement + duplicate text)
 
 All scrapers use stdlib urllib — zero pip installs required.
 """
@@ -30,7 +30,7 @@ import fitpac_db as db
 logger = logging.getLogger("FITPAC_Scrapers")
 
 # Reddit's public API requires a descriptive User-Agent in the format
-#   <platform>:<app ID>:<version> (by /u/<reddit-username>)
+# <platform>:<app ID>:<version> (by /u/<reddit-username>)
 # Generic UAs and anything containing "bot" or ".local" are rate-limited
 # aggressively — especially on cloud/shared IPs (Render, Fly, Heroku).
 # Override at deploy time via env var FITPAC_USER_AGENT if you have a real
@@ -53,24 +53,44 @@ DEFAULT_SUBREDDITS = [
 
 TICKER_RE = re.compile(r"\$([A-Z][A-Z0-9]{1,9})\b")
 
-
 # ---------------------------------------------------------------------------
 # HTTP helper
 # ---------------------------------------------------------------------------
-def _http_get(url: str, extra_headers: Optional[Dict[str, str]] = None) -> dict:
-    """GET url, parse JSON. Re-raises URLError/HTTPError with status for log visibility."""
+def _http_get(
+    url: str,
+    extra_headers: Optional[Dict[str, str]] = None,
+    max_retries: int = 0,
+    backoff_base: float = 2.0,
+) -> dict:
+    """GET url, parse JSON.  Retries on 429 (rate limit) with exponential backoff.
+
+    Parameters
+    ----------
+    max_retries : int
+        How many additional attempts after the first failure (default 0 = no retry).
+    backoff_base : float
+        Seconds multiplied by 2**attempt for the sleep between retries.
+    """
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     if extra_headers:
         headers.update(extra_headers)
     req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        # Surface the HTTP status so the Render log tab shows 403/429 clearly.
-        logger.warning(f"HTTP {e.code} on {url}: {e.reason}")
-        raise urllib.error.URLError(f"HTTP {e.code} {e.reason}") from e
-
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            logger.warning(f"HTTP {e.code} on {url}: {e.reason} (attempt {attempt + 1}/{max_retries + 1})")
+            last_exc = urllib.error.URLError(f"HTTP {e.code} {e.reason}")
+            if e.code == 429 and attempt < max_retries:
+                wait = backoff_base * (2 ** attempt)
+                logger.info(f"Rate limited — retrying in {wait:.1f}s")
+                time.sleep(wait)
+                continue
+            raise last_exc from e
+    # Should never reach here, but just in case:
+    raise last_exc or urllib.error.URLError("max retries exceeded")
 
 # ---------------------------------------------------------------------------
 # DexScreener — liquidity, volume, buy/sell ratio, pair age
@@ -107,7 +127,7 @@ class DexScreenerScraper:
 
         Split out so both the direct address lookup path and the
         DexScreenerResolver (search-by-symbol) path can reuse the same
-        pair → snapshot conversion logic.
+        pair -> snapshot conversion logic.
         """
         now = datetime.now(timezone.utc).replace(microsecond=0)
         created_ms = pair.get("pairCreatedAt")
@@ -137,7 +157,7 @@ class DexScreenerScraper:
             "txns_1h_sells": sells_1h,
             "insider_distribution_ratio": round(insider_ratio, 4),
             "contract_age_hours": round(age_hours, 2) if age_hours is not None else None,
-            "lp_locked": 0,  # DexScreener doesn't expose this; set via Etherscan/Solscan scraper
+            "lp_locked": 0,   # DexScreener doesn't expose this; set via Etherscan/Solscan scraper
             "raw_json": json.dumps(pair)[:8000],
         }
 
@@ -150,53 +170,34 @@ class DexScreenerScraper:
             return None
         return self.pair_to_snapshot(ticker, chain, pair)
 
-
 # ---------------------------------------------------------------------------
 # DexScreener Resolver — auto-discover token_address by ticker symbol
-# ---------------------------------------------------------------------------
-# Why this exists:
-#   On Render/Fly/Heroku egress IPs, the /latest/dex/tokens/{addr} endpoint
-#   sometimes returns empty pairs (likely intermittent rate limiting), which
-#   causes the primary scrape to fail and the backend to mark the ticker as
-#   CHAIN UNVERIFIED — capping confidence at ~0.40 and suppressing ignition.
-#
-# The /search?q= endpoint is a different code path that (empirically) behaves
-# more forgivingly from cloud IPs. It also returns the full pair dict inline,
-# so even if /tokens/{addr} keeps failing we can still emit a snapshot.
-#
-# Resolved addresses are persisted back to the tickers table so the search
-# cost is paid at most once per ticker per container lifetime.
 # ---------------------------------------------------------------------------
 class DexScreenerResolver:
     SEARCH = "https://api.dexscreener.com/latest/dex/search?q={query}"
 
-    # Pools below this liquidity floor are almost always scammer squats on a
-    # popular symbol. We skip them to avoid polluting the snapshot with noise.
     MIN_LIQUIDITY_USD = 50_000
 
-    # DexScreener chainId → our internal chain name. Most are identity mappings;
-    # listed explicitly so the set of allowed chains is reviewable at a glance.
     CHAIN_MAP = {
-        "ethereum":  "ethereum",
-        "solana":    "solana",
-        "base":      "base",
-        "bsc":       "bsc",
-        "polygon":   "polygon",
-        "arbitrum":  "arbitrum",
-        "optimism":  "optimism",
+        "ethereum": "ethereum",
+        "solana": "solana",
+        "base": "base",
+        "bsc": "bsc",
+        "polygon": "polygon",
+        "arbitrum": "arbitrum",
+        "optimism": "optimism",
         "moonriver": "moonriver",
-        "blast":     "blast",
+        "blast": "blast",
         "avalanche": "avalanche",
-        "fantom":    "fantom",
-        "sui":       "sui",
-        "ton":       "ton",
+        "fantom": "fantom",
+        "sui": "sui",
+        "ton": "ton",
     }
 
     def resolve(self, ticker: str, hint_chain: Optional[str] = None) -> Optional[Dict]:
         """Search DexScreener for `ticker` and return the best matching pool.
 
         Returns: dict(chain, token_address, pair) or None.
-        Best-effort — returns None on HTTP error, no matches, or low liquidity.
         """
         symbol = ticker.lstrip("$").upper()
         if not symbol:
@@ -209,8 +210,6 @@ class DexScreenerResolver:
             return None
 
         pairs = data.get("pairs") or []
-        # Symbol must match the baseToken exactly (case-insensitive), AND the
-        # pool must clear the minimum liquidity floor.
         candidates = [
             p for p in pairs
             if (p.get("baseToken") or {}).get("symbol", "").upper() == symbol
@@ -218,19 +217,17 @@ class DexScreenerResolver:
         ]
         if not candidates:
             logger.info(
-                f"{ticker} | DexScreener search returned no pairs ≥ "
+                f"{ticker} | DexScreener search returned no pairs >= "
                 f"${self.MIN_LIQUIDITY_USD:,.0f} liquidity."
             )
             return None
 
-        # Prefer the hinted chain if we have one (from the seeded DB row)
         if hint_chain:
             preferred_id = self.CHAIN_MAP.get(hint_chain, hint_chain)
             on_hint = [p for p in candidates if p.get("chainId") == preferred_id]
             if on_hint:
                 candidates = on_hint
 
-        # Deepest liquidity wins
         best = max(candidates, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
         chain_id = best.get("chainId") or "unknown"
         chain_name = self.CHAIN_MAP.get(chain_id, chain_id)
@@ -240,11 +237,10 @@ class DexScreenerResolver:
             return None
 
         logger.info(
-            f"{ticker} | resolved via /search → chain={chain_name} "
-            f"addr={addr[:10]}… liq=${(best.get('liquidity') or {}).get('usd', 0):,.0f}"
+            f"{ticker} | resolved via /search -> chain={chain_name} "
+            f"addr={addr[:10]}... liq=${(best.get('liquidity') or {}).get('usd', 0):,.0f}"
         )
         return {"chain": chain_name, "token_address": addr, "pair": best}
-
 
 # ---------------------------------------------------------------------------
 # CoinGecko — fallback for non-contract coins (DOGE, etc)
@@ -252,16 +248,36 @@ class DexScreenerResolver:
 class CoinGeckoScraper:
     BASE = "https://api.coingecko.com/api/v3/coins/"
 
+    # Class-level throttle state — shared across all instances so the rate
+    # limit budget is tracked globally even if multiple CoinGeckoScraper
+    # objects exist (shouldn't happen, but defensive).
+    _last_cg_call: float = 0.0
+
+    # Minimum seconds between CoinGecko API calls.  Free tier allows
+    # 10-30 req/min; 4s keeps us safely under 15/min with headroom for
+    # the CoinGeckoTrendingScraper's own call.
+    CG_MIN_INTERVAL: float = 4.0
+
+    def _throttle(self) -> None:
+        """Sleep if needed to respect the per-minute rate limit."""
+        elapsed = time.time() - CoinGeckoScraper._last_cg_call
+        if elapsed < self.CG_MIN_INTERVAL:
+            time.sleep(self.CG_MIN_INTERVAL - elapsed)
+        CoinGeckoScraper._last_cg_call = time.time()
+
     def snapshot(self, ticker: str, coingecko_id: str, chain: str) -> Optional[Dict]:
         if not coingecko_id:
             return None
+
+        self._throttle()
+
         try:
             url = (
                 self.BASE
                 + urllib.parse.quote(coingecko_id)
                 + "?localization=false&tickers=false&community_data=false&developer_data=false"
             )
-            data = _http_get(url)
+            data = _http_get(url, max_retries=2, backoff_base=5.0)
         except urllib.error.URLError as e:
             logger.warning(f"CoinGecko fetch failed for {coingecko_id}: {e}")
             return None
@@ -278,23 +294,18 @@ class CoinGeckoScraper:
             "volume_24h_usd": (md.get("total_volume") or {}).get("usd") or 0.0,
             "txns_1h_buys": None,
             "txns_1h_sells": None,
-            "insider_distribution_ratio": 0.0,  # unknown without on-chain data
+            "insider_distribution_ratio": 0.0,   # unknown without on-chain data
             "contract_age_hours": None,
-            "lp_locked": 1,  # major coins — assume safe
+            "lp_locked": 1,   # major coins — assume safe
             "raw_json": json.dumps({"source": "coingecko", "id": coingecko_id})[:8000],
         }
 
-
 # ---------------------------------------------------------------------------
 # Hyperliquid — orderbook-native L1 ($HYPE, $PURR, spot list)
-#   POST https://api.hyperliquid.xyz/info
-#     {"type": "spotMetaAndAssetCtxs"}  -> [{universe:[...]}, [ctx, ctx, ...]]
-#   Each ctx has: coin, midPx, prevDayPx, dayNtlVlm, markPx, dayBaseVlm,
-#                 openInterest, oraclePx, funding, premium
 # ---------------------------------------------------------------------------
 class HyperliquidScraper:
     BASE = "https://api.hyperliquid.xyz/info"
-    ORDERBOOK = {"type": "l2Book"}  # separate call per coin
+    ORDERBOOK = {"type": "l2Book"}
 
     def _post(self, body: Dict) -> dict:
         data = json.dumps(body).encode("utf-8")
@@ -311,7 +322,6 @@ class HyperliquidScraper:
             return json.loads(r.read().decode("utf-8"))
 
     def _spot_meta_and_ctxs(self) -> Tuple[List[dict], List[dict]]:
-        """Returns (universe, ctxs) where universe[i] corresponds to ctxs[i]."""
         try:
             data = self._post({"type": "spotMetaAndAssetCtxs"})
         except urllib.error.URLError as e:
@@ -324,7 +334,6 @@ class HyperliquidScraper:
         return universe, ctxs
 
     def _l2_book(self, coin_name: str) -> Optional[dict]:
-        """Fetch the orderbook — we use summed bid/ask depth as a liquidity proxy."""
         try:
             return self._post({"type": "l2Book", "coin": coin_name})
         except urllib.error.URLError as e:
@@ -332,7 +341,6 @@ class HyperliquidScraper:
             return None
 
     def _recent_trades(self, coin_name: str) -> List[dict]:
-        """Fetch recent trades so we can derive buy/sell counts (insider proxy)."""
         try:
             res = self._post({"type": "recentTrades", "coin": coin_name})
             return res if isinstance(res, list) else []
@@ -342,7 +350,6 @@ class HyperliquidScraper:
 
     @staticmethod
     def _sum_book_usd(book: dict, mid_price: float) -> float:
-        """Sum ±2% depth in USD notionals across both sides of the book."""
         if not book:
             return 0.0
         levels = book.get("levels") or []
@@ -362,10 +369,6 @@ class HyperliquidScraper:
         return total
 
     def snapshot(self, ticker: str, coin_name: str) -> Optional[Dict]:
-        """
-        Build a chain_snapshots row from Hyperliquid spot data.
-        `coin_name` is the spot asset name (e.g. "HYPE", "PURR") — NOT the perp name.
-        """
         universe, ctxs = self._spot_meta_and_ctxs()
         if not universe:
             return None
@@ -382,15 +385,13 @@ class HyperliquidScraper:
 
         try:
             price = float(ctx.get("markPx") or ctx.get("midPx") or 0.0)
-            vol24_native = float(ctx.get("dayNtlVlm") or 0.0)  # already USD-notional
+            vol24_native = float(ctx.get("dayNtlVlm") or 0.0)
         except (TypeError, ValueError):
             price, vol24_native = 0.0, 0.0
 
-        # Orderbook depth ± 2% of mid (proxy for liquidity_depth_usd)
         book = self._l2_book(coin_name)
         liq = self._sum_book_usd(book, price)
 
-        # Recent trades → derive buys/sells counts in the last hour
         trades = self._recent_trades(coin_name)
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         cutoff = now_ms - 3600_000
@@ -413,7 +414,7 @@ class HyperliquidScraper:
         return {
             "ticker": ticker,
             "chain": "hyperliquid",
-            "pair_address": coin_name,  # spot asset name substitutes for pair address
+            "pair_address": coin_name,
             "snapshot_time": now.isoformat(),
             "price_usd": price,
             "liquidity_depth_usd": round(liq, 2),
@@ -421,22 +422,13 @@ class HyperliquidScraper:
             "txns_1h_buys": buys,
             "txns_1h_sells": sells,
             "insider_distribution_ratio": round(insider, 4),
-            "contract_age_hours": None,  # native asset, no EVM contract age
-            "lp_locked": 1,  # orderbook-native, no LP concept
+            "contract_age_hours": None,
+            "lp_locked": 1,
             "raw_json": json.dumps({"source": "hyperliquid", "coin": coin_name, "ctx": ctx})[:8000],
         }
 
-
 # ---------------------------------------------------------------------------
 # Pump.fun / Solana launchpad scanner
-#   Surfaces trending, newly-graduated Solana tokens (pump.fun suffix on address)
-#   with minimum liquidity + active transaction flow. Returns candidate ticker
-#   rows ready to be registered into the watchlist.
-#
-#   Data sources:
-#     GET https://api.dexscreener.com/token-boosts/top/v1
-#     GET https://api.dexscreener.com/token-boosts/latest/v1
-#     GET https://api.dexscreener.com/latest/dex/tokens/{address}
 # ---------------------------------------------------------------------------
 class PumpFunScanner:
     BOOSTS_TOP = "https://api.dexscreener.com/token-boosts/top/v1"
@@ -447,7 +439,7 @@ class PumpFunScanner:
         self,
         min_liquidity_usd: float = 200_000,
         min_txns_1h: int = 15,
-        max_age_hours: Optional[float] = None,  # None = no age cap
+        max_age_hours: Optional[float] = None,
         pump_fun_only: bool = False,
     ):
         self.min_liquidity = min_liquidity_usd
@@ -467,10 +459,6 @@ class PumpFunScanner:
         return out
 
     def scan(self) -> List[Dict]:
-        """Returns a ranked list of candidate token dicts (strongest buy
-        pressure first). Each dict has: ticker, chain, token_address,
-        coingecko_id (None), display_name, plus the raw snapshot for seeding.
-        """
         boosts = self._boost_list()
         sol = [b for b in boosts if b.get("chainId") == "solana"]
         seen = set()
@@ -508,7 +496,6 @@ class PumpFunScanner:
             created_ms = p.get("pairCreatedAt")
             age_hours = (now_ms - created_ms) / 3600_000 if created_ms else None
 
-            # Liquidity + activity gates
             if liq < self.min_liquidity:
                 continue
             if denom < self.min_txns:
@@ -528,7 +515,6 @@ class PumpFunScanner:
                 "coingecko_id": None,
                 "display_name": name,
                 "is_pump_fun": is_pump,
-                # Snapshot — ready for db.insert_chain_snapshot if desired
                 "snapshot": {
                     "price_usd": float(p.get("priceUsd") or 0.0),
                     "liquidity_depth_usd": float(liq),
@@ -543,7 +529,6 @@ class PumpFunScanner:
                 },
             })
 
-        # Rank by buy pressure (lowest insider first), tiebreak by liquidity desc
         candidates.sort(
             key=lambda c: (c["snapshot"]["insider_distribution_ratio"],
                            -c["snapshot"]["liquidity_depth_usd"])
@@ -551,10 +536,6 @@ class PumpFunScanner:
         return candidates
 
     def register(self, blocklist_tickers: Optional[List[str]] = None, limit: int = 5) -> int:
-        """Scan, dedupe against existing watchlist + blocklist, and insert new
-        tickers into the `tickers` table. Also writes a chain_snapshots row
-        for each one so FITPAC has immediate ground-truth data. Returns count added.
-        """
         blockset = {t.upper() for t in (blocklist_tickers or [])}
         existing = {r["ticker"].upper() for r in db.list_tickers(enabled_only=False)}
         cands = self.scan()
@@ -571,7 +552,6 @@ class PumpFunScanner:
                     "VALUES(?,?,?,?,?)",
                     (c["ticker"], c["chain"], c["token_address"], None, c["display_name"]),
                 )
-            # Write initial snapshot so FITPAC has immediate chain data
             s = c["snapshot"]
             now = datetime.now(timezone.utc).replace(microsecond=0)
             db.insert_chain_snapshot({
@@ -586,7 +566,7 @@ class PumpFunScanner:
                 "txns_1h_sells": s["txns_1h_sells"],
                 "insider_distribution_ratio": s["insider_distribution_ratio"],
                 "contract_age_hours": s["contract_age_hours"],
-                "lp_locked": 1,  # pump.fun graduates use locked-burned LP by default
+                "lp_locked": 1,
                 "raw_json": s["raw_json"],
             })
             logger.info(
@@ -596,44 +576,21 @@ class PumpFunScanner:
             written += 1
         return written
 
-
 # ---------------------------------------------------------------------------
 # CoinGecko Trending — primary social signal source (no auth, no cloud blocks)
 # ---------------------------------------------------------------------------
 class CoinGeckoTrendingScraper:
-    """Pulls the top 15 trending coins and writes one synthetic 'post' per
-    watchlist hit, with count proportional to CoinGecko's internal trending
-    score. Low score = hot → more synthetic posts. This drives
-    SocialTransformerModule's recent-vs-prior window comparison, so a coin
-    entering the trending list produces a real hype_velocity bump.
-
-    Also auto-ingests new trending coins into the watchlist so FITPAC
-    self-discovers emerging tickers without manual curation. See `_autoingest`.
-    """
-
     BASE = "https://api.coingecko.com/api/v3/search/trending"
     AUTHOR = "u/coingecko_trending"
 
-    # Hard cap on total watchlist size. Each ticker adds ~0.3s of DexScreener
-    # throttle + a resolver HTTP call, so at 60 the full chain scrape stays
-    # under ~30s — well within Render's request budget.
     MAX_WATCHLIST_SIZE = 60
-
-    # Screen out scammer clones: CoinGecko assigns market_cap_rank only to
-    # coins with a verified exchange listing. Anything beyond this rank (or
-    # missing a rank entirely) is skipped.
     MAX_MARKET_CAP_RANK = 10_000
 
     def _autoingest(self, coins: List[dict]) -> int:
-        """Add any trending coin not already on the watchlist, up to cap.
-
-        Inserted rows have chain='unknown' and token_address=NULL — the
-        DexScreenerResolver fills both in on the next chain scrape cycle.
-        """
         try:
             current_count = db.count_tickers()
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"Auto-ingest: count_tickers failed — skipping: {e}")
+            logger.warning(f"Auto-ingest: count_tickers failed -- skipping: {e}")
             return 0
 
         added = 0
@@ -655,7 +612,7 @@ class CoinGeckoTrendingScraper:
             try:
                 inserted = db.insert_ticker_if_new(
                     ticker=ticker,
-                    chain="unknown",  # resolver will overwrite on first chain scrape
+                    chain="unknown",
                     coingecko_id=item.get("id"),
                     display_name=item.get("name") or symbol,
                 )
@@ -665,22 +622,26 @@ class CoinGeckoTrendingScraper:
             if inserted:
                 logger.info(
                     f"Auto-ingested {ticker} (rank={rank}, cg_id={item.get('id')}) "
-                    "— resolver will map chain address next cycle."
+                    "-- resolver will map chain address next cycle."
                 )
                 added += 1
         return added
 
     def scrape(self, watchlist_tickers: List[str]) -> List[Dict]:
+        # Respect CoinGecko rate limit (shares budget with CoinGeckoScraper)
+        elapsed = time.time() - CoinGeckoScraper._last_cg_call
+        if elapsed < CoinGeckoScraper.CG_MIN_INTERVAL:
+            time.sleep(CoinGeckoScraper.CG_MIN_INTERVAL - elapsed)
+        CoinGeckoScraper._last_cg_call = time.time()
+
         try:
-            data = _http_get(self.BASE)
+            data = _http_get(self.BASE, max_retries=1, backoff_base=5.0)
         except urllib.error.URLError as e:
             logger.warning(f"CoinGecko trending fetch failed: {e}")
             return []
 
         coins = data.get("coins") or []
 
-        # Auto-grow the watchlist from trending before we build the hit set,
-        # so newly-added tickers get synthetic posts emitted THIS cycle.
         if self._autoingest(coins):
             watchlist_tickers = [r["ticker"] for r in db.list_tickers()]
 
@@ -695,7 +656,7 @@ class CoinGeckoTrendingScraper:
             if ticker not in watchset:
                 continue
 
-            score = int(item.get("score") or 0)              # 0=hottest
+            score = int(item.get("score") or 0)
             rank = item.get("market_cap_rank") or 9999
             name = item.get("name") or symbol
             slug = item.get("slug") or item.get("id") or ""
@@ -705,9 +666,6 @@ class CoinGeckoTrendingScraper:
             if isinstance(price_change, dict):
                 pct_24h = float(price_change.get("usd") or 0.0)
 
-            # Synthetic post count proportional to heat. Score 0 → 5 posts,
-            # score ≥ 4 → 1 post. Drives hype_velocity ratio when a coin
-            # moves up/down the trending list between cycles.
             heat = max(1, 5 - score)
 
             for i in range(heat):
@@ -734,19 +692,10 @@ class CoinGeckoTrendingScraper:
         logger.info(f"CoinGecko trending: emitted {len(out)} synthetic posts")
         return out
 
-
 # ---------------------------------------------------------------------------
 # Reddit — organic social mentions (with OAuth upgrade path)
 # ---------------------------------------------------------------------------
 class RedditScraper:
-    """Two modes:
-      (1) OAuth (recommended for cloud deploys). Set REDDIT_CLIENT_ID,
-          REDDIT_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD env vars. Hits
-          https://oauth.reddit.com with a bearer token. 60 req/min limit.
-      (2) Unauthenticated JSON. Reddit hard-blocks this from most cloud IPs
-          (Render, Fly, Heroku). Kept as a fallback for local dev.
-    Toggle-off entirely with FITPAC_REDDIT_ENABLE=0 (default: auto)."""
-
     UNAUTH_BASE = "https://www.reddit.com/r/{sub}/new.json?limit={limit}"
     OAUTH_BASE = "https://oauth.reddit.com/r/{sub}/new?limit={limit}"
     TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
@@ -770,7 +719,6 @@ class RedditScraper:
         return os.environ.get("FITPAC_REDDIT_ENABLE", "auto") != "0"
 
     def _fetch_oauth_token(self) -> Optional[str]:
-        """Grab a fresh bearer token via password grant (script-app flow)."""
         import base64
         auth_raw = f"{self.client_id}:{self.client_secret}".encode("utf-8")
         auth = base64.b64encode(auth_raw).decode("utf-8")
@@ -826,7 +774,6 @@ class RedditScraper:
         return [c["data"] for c in children if c.get("kind") == "t3"]
 
     def scrape(self, watchlist_tickers: List[str]) -> List[Dict]:
-        """Returns a list of post dicts ready for db.bulk_upsert_posts()."""
         watchset = {t.upper() for t in watchlist_tickers}
         out: List[Dict] = []
         for sub in self.subreddits:
@@ -835,7 +782,6 @@ class RedditScraper:
             for p in posts:
                 combined = f"{p.get('title','')} {p.get('selftext','')}".strip()
                 tickers_found = {"$" + m for m in TICKER_RE.findall(combined)}
-                # Always prefix with $ for matching
                 hits = sorted(tickers_found & watchset)
                 if not hits:
                     continue
@@ -843,7 +789,6 @@ class RedditScraper:
                     float(p.get("created_utc") or 0), tz=timezone.utc
                 ).replace(microsecond=0).isoformat()
                 engagement = int(p.get("score") or 0) + int(p.get("num_comments") or 0)
-                # One post can mention multiple tickers → emit one row per ticker
                 for t in hits:
                     out.append({
                         "id": f"reddit:{p.get('id')}:{t}",
@@ -856,23 +801,16 @@ class RedditScraper:
                         "engagement": engagement,
                         "bot_flag": 0,
                     })
-            time.sleep(1)  # polite throttle
+            time.sleep(1)
         return out
 
-
 # ---------------------------------------------------------------------------
-# Bot heuristics — runs AFTER posts are staged so we can compare across authors
+# Bot heuristics
 # ---------------------------------------------------------------------------
 class BotFilter:
-    """Flags posts that look astroturfed. Conservative by design."""
-
     BOT_KEYWORDS = ("100x", "1000x", "moon mission", "join telegram", "dont miss",
                     "next gem", "pre-sale", "presale", "stealth launch")
 
-    # Synthetic feeds we produce ourselves (CoinGecko trending, etc.) aren't
-    # astroturf — they're structured ground-truth data. Exempt their authors
-    # from heuristics that would otherwise flag them for same-author burst or
-    # duplicate text.
     TRUSTED_AUTHORS = {"u/coingecko_trending"}
 
     def score(self, posts: List[Dict]) -> List[Dict]:
@@ -902,7 +840,6 @@ class BotFilter:
         logger.info(f"BotFilter: flagged {flagged}/{len(posts)} posts as likely bots.")
         return posts
 
-
 # ---------------------------------------------------------------------------
 # High-level runners
 # ---------------------------------------------------------------------------
@@ -910,42 +847,52 @@ def scrape_chain_all() -> int:
     """Fetch a fresh chain snapshot for every enabled ticker. Returns # written.
 
     Fallback order per ticker:
-      1. Hyperliquid spot (for $HYPE and friends)
-      2. DexScreener /tokens/{addr}    — fast path, uses seeded address
-      3. DexScreener /search?q={sym}   — resolver fallback; also self-heals
-                                         stale/wrong addresses and persists
-                                         the fix back to the tickers table
-      4. CoinGecko /coins/{id}         — for non-DEX assets ($DOGE, $TAO)
+      1. Hyperliquid spot  (for $HYPE and friends)
+      2. DexScreener /tokens/{addr}  -- fast path, uses seeded address
+      3. CoinGecko /coins/{id}  -- for tickers WITHOUT a token_address but
+         WITH a coingecko_id (e.g. $DOGE, $TAO, auto-ingested trending).
+         Tried BEFORE the resolver because these coins rarely have DEX pairs
+         under their native symbol, so the resolver search would just waste
+         an API call and delay the cycle.
+      4. DexScreener /search?q={sym}  -- resolver fallback; also self-heals
+         stale/wrong addresses and persists the fix back to the tickers table
+      5. CoinGecko /coins/{id}  -- final fallback for tickers that HAD a
+         token_address but DexScreener returned no pairs
     """
     dex = DexScreenerScraper()
-    cg = CoinGeckoScraper()
-    hl = HyperliquidScraper()
+    cg  = CoinGeckoScraper()
+    hl  = HyperliquidScraper()
     resolver = DexScreenerResolver()
     written = 0
     for row in db.list_tickers():
         snap = None
         ticker = row["ticker"]
-        chain = row["chain"]
+        chain  = row["chain"]
 
-        # Hyperliquid-native spot assets: coin name lives in token_address slot.
+        # --- Step 1: Hyperliquid-native spot assets ---
         if chain == "hyperliquid" and row["token_address"]:
             snap = hl.snapshot(ticker, row["token_address"])
         else:
-            # Fast path: use the seeded on-chain address
+            # --- Step 2: DexScreener by seeded address (fast path) ---
             if row["token_address"]:
                 snap = dex.snapshot(ticker, row["token_address"], chain)
 
-            # Resolver fallback: if the seeded address returned no pairs (or
-            # there's no seeded address at all), search DexScreener by symbol.
+            # --- Step 3: CoinGecko FIRST for tickers without DEX address ---
+            # Major L1 coins ($DOGE, $TAO, $BTC) and auto-ingested trending
+            # coins don't have meaningful DEX pairs under their native symbol.
+            # CoinGecko is the authoritative source for these — try it before
+            # burning a DexScreener /search call that will likely fail.
+            if snap is None and not row["token_address"] and row["coingecko_id"]:
+                logger.info(f"{ticker} | no token_address; trying CoinGecko first (id={row['coingecko_id']})")
+                snap = cg.snapshot(ticker, row["coingecko_id"], chain)
+
+            # --- Step 4: DexScreener resolver (search by symbol) ---
             if snap is None and chain != "hyperliquid":
                 resolved = resolver.resolve(ticker, hint_chain=chain)
                 if resolved:
-                    # The resolver already has the pair data — build a snapshot
-                    # directly from it rather than paying for a second HTTP call.
                     snap = DexScreenerScraper.pair_to_snapshot(
                         ticker, resolved["chain"], resolved["pair"]
                     )
-                    # Persist the resolved address so next cycle skips the search.
                     try:
                         db.update_ticker_address(
                             ticker, resolved["chain"], resolved["token_address"]
@@ -955,9 +902,12 @@ def scrape_chain_all() -> int:
                             f"{ticker} | failed to persist resolved address: {exc}"
                         )
 
-        # Last-resort: CoinGecko for non-DEX assets
-        if snap is None and row["coingecko_id"]:
-            snap = cg.snapshot(ticker, row["coingecko_id"], chain)
+            # --- Step 5: CoinGecko final fallback ---
+            # For tickers that HAD a token_address but DexScreener still
+            # returned no pairs (intermittent API failure, delisted pair, etc.)
+            if snap is None and row["coingecko_id"] and row["token_address"]:
+                logger.info(f"{ticker} | DexScreener failed; falling back to CoinGecko (id={row['coingecko_id']})")
+                snap = cg.snapshot(ticker, row["coingecko_id"], chain)
 
         if snap:
             db.insert_chain_snapshot(snap)
@@ -966,19 +916,13 @@ def scrape_chain_all() -> int:
                 f"{ticker:<10} | liq=${snap['liquidity_depth_usd']:,.0f} "
                 f"| sells_1h={snap['txns_1h_sells']} | insider_proxy={snap['insider_distribution_ratio']}"
             )
-        time.sleep(0.3)  # polite throttle for DexScreener
+        else:
+            logger.warning(f"{ticker:<10} | ALL SOURCES FAILED — chain_data_missing will be set")
+        time.sleep(0.3)   # polite throttle for DexScreener
     return written
 
-
 def scrape_social_all() -> int:
-    """Fuse social signal from all available sources. Returns # posts written.
-
-    Order:
-      1. CoinGecko trending — always runs (no auth, no cloud blocks).
-      2. Reddit — runs only if OAuth creds set OR FITPAC_REDDIT_ENABLE=force.
-         On cloud IPs the unauth JSON endpoint is basically guaranteed to
-         fail, so we don't even try unless OAuth is configured.
-    Both streams are merged, bot-filtered, and upserted together."""
+    """Fuse social signal from all available sources. Returns # posts written."""
     watchlist = [t["ticker"] for t in db.list_tickers()]
     combined: List[Dict] = []
 
@@ -991,10 +935,10 @@ def scrape_social_all() -> int:
     if not reddit.enabled:
         logger.info("Reddit scraping disabled via FITPAC_REDDIT_ENABLE=0")
     elif reddit.has_oauth:
-        logger.info("Reddit OAuth credentials present — scraping via oauth.reddit.com")
+        logger.info("Reddit OAuth credentials present -- scraping via oauth.reddit.com")
         combined.extend(reddit.scrape(watchlist))
     elif os.environ.get("FITPAC_REDDIT_ENABLE") == "force":
-        logger.info("Reddit scraping forced (unauth mode) — expect 403s on cloud IPs")
+        logger.info("Reddit scraping forced (unauth mode) -- expect 403s on cloud IPs")
         combined.extend(reddit.scrape(watchlist))
     else:
         logger.info(
@@ -1004,7 +948,6 @@ def scrape_social_all() -> int:
 
     filtered = BotFilter().score(combined)
     return db.bulk_upsert_posts(filtered)
-
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
